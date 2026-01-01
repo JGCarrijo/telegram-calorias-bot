@@ -7,19 +7,19 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
-# 1. Configurações Iniciais
+# 1. Carrega as chaves do seu arquivo .env local
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 if not TOKEN or not GEMINI_API_KEY:
-    print("❌ Erro: Chaves não configuradas no .env")
+    print("❌ ERRO: Verifique se TELEGRAM_BOT_TOKEN e GEMINI_API_KEY estão no seu .env")
     exit()
 
 DATA_FILE = "data.json"
 META_CALORIAS = 3300
 
-# 2. Funções de Sistema
+# 2. Funções de Auxílio
 def load_data():
     if not os.path.exists(DATA_FILE): return {}
     with open(DATA_FILE, "r", encoding="utf-8") as f:
@@ -34,18 +34,18 @@ def encode_image(image_path):
     with open(image_path, "rb") as image_file:
         return base64.b64encode(image_file.read()).decode('utf-8')
 
-# 3. Função de Inteligência Artificial (Corrigida)
+# 3. Integração com Gemini (URL ESTÁVEL V1)
 def ask_gemini(description=None, image_path=None):
-    # URL com sufixo -latest para evitar erro 404
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={GEMINI_API_KEY}"
+    # Esta URL v1 é a que o seu terminal confirmou ser a correta
+    url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
     
-    prompt = """Você é um nutricionista. Analise o que foi enviado e responda APENAS um JSON.
-    Exemplo: {"food": "Frango com arroz", "calories": 450}
-    Se não for comida, responda: {"food": null, "calories": null}"""
+    prompt = """Você é um nutricionista. Analise a entrada e retorne APENAS um JSON.
+    Exemplo: {"food": "Arroz e Feijão", "calories": 350}
+    Se não for comida, use: {"food": null, "calories": null}"""
 
     parts = [{"text": prompt}]
     if description:
-        parts.append({"text": f"O usuário diz: {description}"})
+        parts.append({"text": f"Usuário descreveu: {description}"})
     if image_path:
         parts.append({
             "inline_data": {
@@ -60,33 +60,31 @@ def ask_gemini(description=None, image_path=None):
         r = requests.post(url, json=payload, timeout=30)
         
         if r.status_code != 200:
-            print(f"❌ Erro na API. Status: {r.status_code}")
-            # Se der 400 aqui, verifique se sua chave tem espaços extras no .env
+            print(f"❌ Erro na API (Status {r.status_code})")
             return None
             
         res_data = r.json()
         raw_text = res_data["candidates"][0]["content"]["parts"][0]["text"].strip()
         
-        # Limpa formatações de código (```json) que a IA costuma colocar
+        # Remove possíveis blocos de código markdown que a IA envia
         clean_json = raw_text.replace("```json", "").replace("```", "").strip()
         return json.loads(clean_json)
     except Exception as e:
-        print(f"⚠️ Erro ao processar IA: {type(e).__name__}")
+        print(f"⚠️ Erro ao processar resposta: {e}")
         return None
 
-# 4. Handlers do Telegram
+# 4. Comandos do Bot
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🍎 *NutriBot Online!* \nEnvie uma foto ou descreva o que comeu.")
+    await update.message.reply_text("🍎 *NutriBot Pronto!* \nEnvie uma foto da comida ou descreva o que comeu.")
 
 async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.message.from_user.id)
     today = str(date.today())
     image_path = None
 
-    status = await update.message.reply_text("🧐 Analisando...")
+    status_msg = await update.message.reply_text("⏳ Analisando sua refeição...")
 
     if update.message.photo:
-        # Pega a foto de maior qualidade
         photo = await update.message.photo[-1].get_file()
         image_path = f"temp_{user_id}.jpg"
         await photo.download_to_drive(image_path)
@@ -102,22 +100,21 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data[user_id][today]["calories"] += cal
         save_data(data)
 
-        await status.edit_text(
-            f"✅ *{result['food']}*\n🔥 +{cal} kcal\n📊 Total hoje: {data[user_id][today]['calories']} kcal"
+        await status_msg.edit_text(
+            f"✅ *{result['food']}*\n🔥 +{cal} kcal\n📊 Total hoje: {data[user_id][today]['calories']} / {META_CALORIAS} kcal",
+            parse_mode="Markdown"
         )
     else:
-        await status.edit_text("❌ Não consegui identificar. Tente descrever por texto.")
+        await status_msg.edit_text("❌ Não consegui identificar o alimento. Tente tirar outra foto ou escrever o nome.")
 
-    # Apaga a imagem temporária
     if image_path and os.path.exists(image_path):
         os.remove(image_path)
 
-# 5. Inicialização
+# 5. Execução
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TOKEN).build()
-    
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO & ~filters.COMMAND, handle_input))
     
-    print("🚀 Bot rodando! Mande um 'Oi' no Telegram para testar.")
+    print("🚀 Bot iniciado! Faça o teste agora.")
     app.run_polling()
