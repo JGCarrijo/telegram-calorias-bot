@@ -5,9 +5,10 @@ require "bigdecimal/util"
 require "date"
 require "base64"
 
-TOKEN      = ENV["TELEGRAM_BOT_TOKEN"]
-USDA_KEY   = ENV["USDA_API_KEY"]
-GEMINI_KEY = ENV["GEMINI_API_KEY"]
+# 🔐 COLE SUAS CHAVES AQUI (NÃO COMPARTILHE)
+TOKEN      = "8460032402:AAH1-9x5GpyD30I_bBx6IjDAqFIp_2FV5Zo"
+GEMINI_KEY = "AIzaSyBQbjjMx_5sQ4bNlfkJ5NFTpAmKVYvCOYc"
+USDA_KEY   = "WjwD1SJlqgaJfVWee01JeTkTZF8Cx3e9ShnTIhhH"
 
 META = {
   calories: 3300.to_d,
@@ -124,51 +125,6 @@ loop do
       pending[user] = { image: path }
       tg_post("sendMessage", { chat_id: chat_id, text: "📸 Foto recebida! Agora descreva." })
     end
-
-    if pending[user]&.dig(:image) && msg["text"] && !msg["text"].start_with?("/")
-      info = identify_food(msg["text"], pending[user][:image])
-      base = fetch_usda(info["food"])
-
-      pending[user] = { grams: info["grams"].to_d, base: base }
-
-      tg_post("sendMessage", {
-        chat_id: chat_id,
-        text: "🍽️ #{info["food"]}\n📏 Estimado: #{info["grams"]}g\nDigite a quantidade real ou 'ok'"
-      })
-    end
-
-    if pending[user]&.dig(:base) && msg["text"]
-      grams  = msg["text"] == "ok" ? pending[user][:grams] : msg["text"].to_d
-      factor = grams / 100
-
-      META.each_key do |k|
-        data[user][today][k] += pending[user][:base][k] * factor
-      end
-
-      pending.delete(user)
-      save_data(data)
-
-      c = data[user][today]
-      rest = META[:calories] - c["calories"]
-
-      tg_post("sendMessage", {
-        chat_id: chat_id,
-        text: "🔥 #{c["calories"].to_i}/3300 kcal\n🥩 #{c["protein"].to_i}/175g\n🥑 #{c["fat"].to_i}/95g\n🍞 #{c["carbs"].to_i}/435g\n\n#{rest > 0 ? "👉 Restam #{rest.to_i} kcal 👍" : "⚠️ Meta ultrapassada"}"
-      })
-    end
-
-    if msg["text"] == "/resumo"
-      days = (0..6).map { |i| (Date.today - i).to_s }
-      week = days.map { |d| data[user][d] }.compact
-
-      avg = META.transform_values { 0.to_d }
-      week.each { |d| avg.each_key { |k| avg[k] += d[k].to_d } }
-      avg.each_key { |k| avg[k] /= week.size if week.any? }
-
-      tg_post("sendMessage", {
-        chat_id: chat_id,
-        text: "📊 Últimos 7 dias\n🔥 Média: #{avg[:calories].to_i} kcal\n🥩 #{avg[:protein].to_i}g\n🥑 #{avg[:fat].to_i}g\n🍞 #{avg[:carbs].to_i}g"
-      })
-    end
   end
 end
+
