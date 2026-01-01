@@ -1,5 +1,4 @@
 require "telegram/bot"
-require "google/generative_ai"
 require "net/http"
 require "json"
 require "bigdecimal"
