@@ -15,22 +15,20 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 if not TOKEN or not GEMINI_API_KEY:
-    raise RuntimeError("❌ Variáveis de ambiente TELEGRAM_BOT_TOKEN ou GEMINI_API_KEY não encontradas.")
+    raise RuntimeError("❌ Verifique se TELEGRAM_BOT_TOKEN e GEMINI_API_KEY estão no seu arquivo .env")
 
 DATA_FILE = "data.json"
 META_CALORIAS = 3300
 
 # ========================
-# UTILITÁRIOS DE DADOS
+# UTILITÁRIOS
 # ========================
 def load_data():
-    if not os.path.exists(DATA_FILE):
-        return {}
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        try:
+    if not os.path.exists(DATA_FILE): return {}
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-        except:
-            return {}
+    except: return {}
 
 def save_data(data):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
@@ -41,22 +39,20 @@ def encode_image(image_path):
         return base64.b64encode(image_file.read()).decode('utf-8')
 
 # ========================
-# INTEGRAÇÃO GEMINI VISION
+# INTEGRAÇÃO GEMINI 1.5 FLASH
 # ========================
 def ask_gemini(description=None, image_path=None):
-    # Usamos o endpoint v1 com o modelo gemini-1.5-flash
+    # Endpoint v1 oficial (mais estável que v1beta)
     url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
     
-    prompt = """Você é um assistente de nutrição rigoroso. 
-    Analise a entrada (texto ou imagem) e identifique o alimento e a estimativa de calorias.
-    Responda APENAS um JSON puro, sem markdown, no formato:
-    {"food": "nome do alimento", "calories": 500}
-    Se não for comida, retorne: {"food": null, "calories": null}"""
+    prompt = """Você é um nutricionista. Analise o alimento e retorne APENAS um JSON.
+    Formato: {"food": "nome", "calories": 000}
+    Se não for comida, use null nos campos."""
 
     parts = [{"text": prompt}]
     
     if description:
-        parts.append({"text": f"O usuário diz: {description}"})
+        parts.append({"text": f"Usuário descreveu: {description}"})
     
     if image_path:
         parts.append({
@@ -70,49 +66,39 @@ def ask_gemini(description=None, image_path=None):
 
     try:
         r = requests.post(url, json=payload, timeout=30)
+        
+        if r.status_code == 404:
+            print("❌ ERRO 404: O modelo Gemini 1.5 Flash não foi encontrado. Verifique sua chave de API.")
+            return None
+        if r.status_code == 400:
+            print("❌ ERRO 400: Requisição inválida. Verifique o formato dos dados.")
+            return None
+
         r.raise_for_status()
         res_data = r.json()
         
-        # Extrai o texto da resposta
+        # Extrai e limpa o JSON da resposta
         raw_text = res_data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        
-        # Limpeza de possíveis marcações de markdown ```json ... ```
         clean_json = raw_text.replace("```json", "").replace("```", "").strip()
         
         return json.loads(clean_json)
     except Exception as e:
-        print(f"Erro detalhado na API Gemini: {e}")
+        print(f"⚠️ Erro na API Gemini: {e}")
         return None
 
 # ========================
-# COMANDOS DO TELEGRAM
+# HANDLERS DO TELEGRAM
 # ========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🍎 *Bem-vindo ao NutriBot!*\n\n"
-        "Como usar:\n"
-        "1. Envie uma **foto** do seu prato.\n"
-        "2. Ou digite o que comeu (ex: '2 fatias de pizza').\n"
-        "3. Use /resumo para ver o total do dia.",
-        parse_mode="Markdown"
-    )
-
-async def resumo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.message.from_user.id)
-    today = str(date.today())
-    data = load_data()
-    
-    consumo = data.get(user_id, {}).get(today, {}).get("calories", 0)
-    await update.message.reply_text(f"📊 *Resumo de Hoje*\n🔥 Consumido: {consumo} kcal\n🎯 Meta: {META_CALORIAS} kcal", parse_mode="Markdown")
+    await update.message.reply_text("🍎 Envie uma foto do prato ou texto para contar calorias!")
 
 async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.message.from_user.id)
     today = str(date.today())
     image_path = None
 
-    msg_aguarde = await update.message.reply_text("🤔 Deixa eu ver...")
+    status_msg = await update.message.reply_text("⏳ Analisando...")
 
-    # Verifica se é foto ou texto
     if update.message.photo:
         photo_file = await update.message.photo[-1].get_file()
         image_path = f"temp_{user_id}.jpg"
@@ -121,25 +107,20 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         result = ask_gemini(description=update.message.text)
 
-    # Processa o resultado da IA
     if result and result.get("food"):
         data = load_data()
         data.setdefault(user_id, {}).setdefault(today, {"calories": 0})
         
-        calorias = result["calories"]
-        data[user_id][today]["calories"] += calorias
+        cal = result["calories"]
+        data[user_id][today]["calories"] += cal
         save_data(data)
 
-        texto_sucesso = (
-            f"✅ *Identificado:* {result['food']}\n"
-            f"🔥 *Calorias:* +{calorias} kcal\n"
-            f"📈 *Total hoje:* {data[user_id][today]['calories']} kcal"
+        await status_msg.edit_text(
+            f"✅ {result['food']}\n🔥 +{cal} kcal\n📊 Total hoje: {data[user_id][today]['calories']} kcal"
         )
-        await msg_aguarde.edit_text(texto_sucesso, parse_mode="Markdown")
     else:
-        await msg_aguarde.edit_text("❌ Não consegui identificar. Tente descrever por texto ou tire uma foto mais nítida.")
+        await status_msg.edit_text("❌ Não reconheci o alimento. Tente descrever melhor.")
 
-    # Remove a imagem temporária para não ocupar espaço
     if image_path and os.path.exists(image_path):
         os.remove(image_path)
 
@@ -147,12 +128,8 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # EXECUÇÃO
 # ========================
 if __name__ == "__main__":
+    print("🚀 Bot Iniciado!")
     app = ApplicationBuilder().token(TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("resumo", resumo))
-    # Captura tanto texto quanto foto no mesmo handler
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO & ~filters.COMMAND, handle_input))
-
-    print("🚀 Bot rodando! Aguardando mensagens...")
     app.run_polling()
