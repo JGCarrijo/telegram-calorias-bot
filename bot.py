@@ -7,28 +7,25 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
-# ========================
-# CONFIGURAÇÃO
-# ========================
+# Carrega as chaves do arquivo .env local
 load_dotenv()
+
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 if not TOKEN or not GEMINI_API_KEY:
-    raise RuntimeError("❌ Verifique se TELEGRAM_BOT_TOKEN e GEMINI_API_KEY estão no seu arquivo .env")
+    print("❌ ERRO: Chaves não encontradas no arquivo .env!")
+    exit()
 
 DATA_FILE = "data.json"
 META_CALORIAS = 3300
 
-# ========================
-# UTILITÁRIOS
-# ========================
+# --- FUNÇÕES DE AUXÍLIO ---
 def load_data():
     if not os.path.exists(DATA_FILE): return {}
-    try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except: return {}
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
+        try: return json.load(f)
+        except: return {}
 
 def save_data(data):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
@@ -38,22 +35,17 @@ def encode_image(image_path):
     with open(image_path, "rb") as image_file:
         return base64.b64encode(image_file.read()).decode('utf-8')
 
-# ========================
-# INTEGRAÇÃO GEMINI 1.5 FLASH
-# ========================
+# --- INTEGRAÇÃO COM IA ---
 def ask_gemini(description=None, image_path=None):
-    # Endpoint v1 oficial (mais estável que v1beta)
+    # Endpoint estável v1
     url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
     
-    prompt = """Você é um nutricionista. Analise o alimento e retorne APENAS um JSON.
-    Formato: {"food": "nome", "calories": 000}
-    Se não for comida, use null nos campos."""
+    prompt = """Você é um assistente de nutrição. Analise a entrada e retorne APENAS um JSON.
+    Formato: {"food": "nome do alimento", "calories": 000}
+    Se não for comida, retorne {"food": null, "calories": null}."""
 
     parts = [{"text": prompt}]
-    
-    if description:
-        parts.append({"text": f"Usuário descreveu: {description}"})
-    
+    if description: parts.append({"text": f"Texto do usuário: {description}"})
     if image_path:
         parts.append({
             "inline_data": {
@@ -62,47 +54,33 @@ def ask_gemini(description=None, image_path=None):
             }
         })
 
-    payload = {"contents": [{"parts": parts}]}
-
     try:
-        r = requests.post(url, json=payload, timeout=30)
-        
-        if r.status_code == 404:
-            print("❌ ERRO 404: O modelo Gemini 1.5 Flash não foi encontrado. Verifique sua chave de API.")
-            return None
-        if r.status_code == 400:
-            print("❌ ERRO 400: Requisição inválida. Verifique o formato dos dados.")
-            return None
-
+        r = requests.post(url, json={"contents": [{"parts": parts}]}, timeout=30)
         r.raise_for_status()
-        res_data = r.json()
+        res_text = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
         
-        # Extrai e limpa o JSON da resposta
-        raw_text = res_data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        clean_json = raw_text.replace("```json", "").replace("```", "").strip()
-        
+        # Limpa markdown ```json se houver
+        clean_json = res_text.replace("```json", "").replace("```", "").strip()
         return json.loads(clean_json)
     except Exception as e:
-        print(f"⚠️ Erro na API Gemini: {e}")
+        print(f"Erro na API: {e}")
         return None
 
-# ========================
-# HANDLERS DO TELEGRAM
-# ========================
+# --- HANDLERS DO TELEGRAM ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🍎 Envie uma foto do prato ou texto para contar calorias!")
+    await update.message.reply_text("🍎 Mande uma foto ou texto da sua refeição!")
 
 async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.message.from_user.id)
     today = str(date.today())
     image_path = None
 
-    status_msg = await update.message.reply_text("⏳ Analisando...")
+    status = await update.message.reply_text("🧐 Analisando...")
 
     if update.message.photo:
-        photo_file = await update.message.photo[-1].get_file()
+        photo = await update.message.photo[-1].get_file()
         image_path = f"temp_{user_id}.jpg"
-        await photo_file.download_to_drive(image_path)
+        await photo.download_to_drive(image_path)
         result = ask_gemini(image_path=image_path)
     else:
         result = ask_gemini(description=update.message.text)
@@ -110,26 +88,23 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if result and result.get("food"):
         data = load_data()
         data.setdefault(user_id, {}).setdefault(today, {"calories": 0})
-        
-        cal = result["calories"]
-        data[user_id][today]["calories"] += cal
+        data[user_id][today]["calories"] += result["calories"]
         save_data(data)
 
-        await status_msg.edit_text(
-            f"✅ {result['food']}\n🔥 +{cal} kcal\n📊 Total hoje: {data[user_id][today]['calories']} kcal"
+        await status.edit_text(
+            f"✅ {result['food']}\n🔥 +{result['calories']} kcal\n"
+            f"📊 Total hoje: {data[user_id][today]['calories']} kcal"
         )
     else:
-        await status_msg.edit_text("❌ Não reconheci o alimento. Tente descrever melhor.")
+        await status.edit_text("❌ Não identifiquei o alimento.")
 
     if image_path and os.path.exists(image_path):
         os.remove(image_path)
 
-# ========================
-# EXECUÇÃO
-# ========================
+# --- INICIALIZAÇÃO ---
 if __name__ == "__main__":
-    print("🚀 Bot Iniciado!")
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO & ~filters.COMMAND, handle_input))
+    print("🚀 Bot rodando localmente e protegido!")
     app.run_polling()
