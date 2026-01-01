@@ -5,6 +5,7 @@ require "bigdecimal"
 require "bigdecimal/util"
 require "date"
 require "base64"
+require "logger" 
 
 TOKEN = ENV["TELEGRAM_BOT_TOKEN"]
 USDA_KEY = ENV["USDA_API_KEY"]
@@ -78,7 +79,8 @@ def identify_food(text, image_path)
   JSON.parse(json["candidates"][0]["content"]["parts"][0]["text"])
 end
 
-Telegram::Bot::Client.run(TOKEN) do |bot|
+# 🔽 AQUI ESTÁ A MUDANÇA PRINCIPAL
+Telegram::Bot::Client.run(TOKEN, logger: Logger.new($stdout)) do |bot|
   data = load_data
   pending = {}
 
