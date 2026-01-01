@@ -1,24 +1,27 @@
+import os
 import json
 import base64
-import requests
+import logging
+import unicodedata
 from datetime import date, timedelta
+
+import requests
+from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters
-)
+from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
 
 # =====================
-# 🔑 TOKENS (fixos)
+# CONFIGURAÇÃO
 # =====================
-TELEGRAM_TOKEN = "8460032402:AAH1-9x5GpyD30I_bBx6IjDAqFIp_2FV5Zo"
-GEMINI_API_KEY = "AIzaSyBQbjjMx_5sQ4bNlfkJ5NFTpAmKVYvCOYc"
-USDA_API_KEY = "WjwD1SJlqgaJfVWee01JeTkTZF8Cx3e9ShnTIhhH"
 
-DATA_FILE = "data.json"
+load_dotenv()
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+USDA_KEY = os.getenv("USDA_API_KEY")
+
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("❌ TELEGRAM_BOT_TOKEN não definido")
 
 META = {
     "calories": 3300,
@@ -27,40 +30,54 @@ META = {
     "carbs": 435
 }
 
-pending = {}
+DATA_FILE = "data.json"
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # =====================
-# 📦 Persistência
+# UTILIDADES
 # =====================
+
+def normalize(text: str) -> str:
+    text = text.lower()
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(c for c in text if unicodedata.category(c) != "Mn")
+    return text.strip()
+
 def load_data():
-    try:
+    if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    except:
-        return {}
+    return {}
 
 def save_data(data):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 # =====================
-# 🥗 USDA
+# USDA
 # =====================
+
 def fetch_usda(food):
     url = "https://api.nal.usda.gov/fdc/v1/foods/search"
     params = {
-        "api_key": USDA_API_KEY,
+        "api_key": USDA_KEY,
         "query": food,
         "pageSize": 1
     }
-    r = requests.get(url, params=params).json()
-    nutrients = r["foods"][0]["foodNutrients"]
+
+    r = requests.get(url, params=params, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+
+    nutrients = data["foods"][0]["foodNutrients"]
 
     def get(name):
         for n in nutrients:
             if name in n["nutrientName"].lower():
-                return n.get("value", 0)
-        return 0
+                return float(n["value"])
+        return 0.0
 
     return {
         "calories": get("energy"),
@@ -70,33 +87,48 @@ def fetch_usda(food):
     }
 
 # =====================
-# 🧠 Gemini Vision
+# GEMINI (IMAGEM)
 # =====================
+
 def identify_food(text, image_path):
-    with open(image_path, "rb") as f:
-        img_b64 = base64.b64encode(f.read()).decode()
+    image_b64 = base64.b64encode(open(image_path, "rb").read()).decode()
+
+    prompt = f"""
+Analise a imagem e o texto: "{text}"
+Retorne APENAS JSON neste formato:
+{{ "food": "nome do alimento", "grams": numero }}
+"""
 
     body = {
         "contents": [{
             "parts": [
-                {"text": f'Analise a imagem e o texto "{text}". Retorne APENAS JSON no formato {{ "food": "nome", "grams": numero }}'},
+                {"text": prompt},
                 {
                     "inline_data": {
                         "mime_type": "image/jpeg",
-                        "data": img_b64
+                        "data": image_b64
                     }
                 }
             ]
         }]
     }
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro-vision:generateContent?key={GEMINI_API_KEY}"
-    r = requests.post(url, json=body).json()
-    return json.loads(r["candidates"][0]["content"]["parts"][0]["text"])
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro-vision:generateContent?key={GEMINI_KEY}"
+
+    r = requests.post(url, json=body, timeout=60)
+    r.raise_for_status()
+    response = r.json()
+
+    text_response = response["candidates"][0]["content"]["parts"][0]["text"]
+    return json.loads(text_response)
 
 # =====================
-# 🤖 Handlers
+# BOT
 # =====================
+
+data = load_data()
+pending = {}
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📸 Envie a foto da refeição + descrição\n"
@@ -105,101 +137,114 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def resumo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    user = str(update.effective_user.id)
-
+    user = str(update.message.from_user.id)
     days = [(date.today() - timedelta(days=i)).isoformat() for i in range(7)]
-    week = [data.get(user, {}).get(d) for d in days if d in data.get(user, {})]
 
-    if not week:
-        await update.message.reply_text("Sem dados ainda 🙂")
+    totals = {"calories": 0, "protein": 0, "fat": 0, "carbs": 0}
+    count = 0
+
+    for d in days:
+        if user in data and d in data[user]:
+            for k in totals:
+                totals[k] += data[user][d][k]
+            count += 1
+
+    if count == 0:
+        await update.message.reply_text("📊 Nenhum dado nos últimos 7 dias.")
         return
 
-    avg = {k: sum(d[k] for d in week) / len(week) for k in META}
+    for k in totals:
+        totals[k] /= count
+
     await update.message.reply_text(
-        f"📊 Últimos 7 dias\n"
-        f"🔥 {int(avg['calories'])} kcal\n"
-        f"🥩 {int(avg['protein'])} g\n"
-        f"🥑 {int(avg['fat'])} g\n"
-        f"🍞 {int(avg['carbs'])} g"
+        f"📊 Média 7 dias\n"
+        f"🔥 {int(totals['calories'])} kcal\n"
+        f"🥩 {int(totals['protein'])} g\n"
+        f"🥑 {int(totals['fat'])} g\n"
+        f"🍞 {int(totals['carbs'])} g"
     )
 
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message.text.lower()
-    user = str(update.effective_user.id)
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = str(update.message.from_user.id)
     today = date.today().isoformat()
 
-    data = load_data()
     data.setdefault(user, {})
-    data[user].setdefault(today, {k: 0 for k in META})
+    data[user].setdefault(today, {"calories": 0, "protein": 0, "fat": 0, "carbs": 0})
 
-    if msg == "primeira refeição":
-        data[user][today] = {k: 0 for k in META}
+    text = normalize(update.message.text or "")
+
+    # PRIMEIRA REFEIÇÃO
+    if "primeira refeicao" in text:
+        data[user][today] = {"calories": 0, "protein": 0, "fat": 0, "carbs": 0}
         save_data(data)
-        await update.message.reply_text("🔄 Novo dia iniciado")
+        await update.message.reply_text("🔄 Novo dia iniciado!")
         return
 
+    # FOTO
+    if update.message.photo:
+        file = await update.message.photo[-1].get_file()
+        path = f"temp_{user}.jpg"
+        await file.download_to_drive(path)
+        pending[user] = {"image": path}
+        await update.message.reply_text("📸 Foto recebida! Agora descreva.")
+        return
+
+    # TEXTO APÓS FOTO
+    if user in pending and "image" in pending[user]:
+        try:
+            info = identify_food(text, pending[user]["image"])
+            base = fetch_usda(info["food"])
+
+            pending[user] = {
+                "grams": info["grams"],
+                "base": base
+            }
+
+            await update.message.reply_text(
+                f"🍽️ {info['food']}\n"
+                f"📏 Estimado: {info['grams']} g\n"
+                "Digite a quantidade real ou 'ok'"
+            )
+        except Exception as e:
+            logger.exception(e)
+            pending.pop(user, None)
+            await update.message.reply_text(
+                "⚠️ Não consegui identificar o alimento.\n"
+                "Tente uma descrição mais clara."
+            )
+        return
+
+    # CONFIRMAÇÃO
     if user in pending and "base" in pending[user]:
-        grams = pending[user]["grams"] if msg == "ok" else float(msg)
+        grams = pending[user]["grams"] if text == "ok" else float(text)
         factor = grams / 100
 
         for k in META:
             data[user][today][k] += pending[user]["base"][k] * factor
 
-        save_data(data)
         pending.pop(user)
+        save_data(data)
 
         c = data[user][today]
+        rest = META["calories"] - c["calories"]
+
         await update.message.reply_text(
             f"🔥 {int(c['calories'])}/{META['calories']} kcal\n"
             f"🥩 {int(c['protein'])}/{META['protein']} g\n"
             f"🥑 {int(c['fat'])}/{META['fat']} g\n"
-            f"🍞 {int(c['carbs'])}/{META['carbs']} g"
+            f"🍞 {int(c['carbs'])}/{META['carbs']} g\n\n"
+            f"{'👉 Restam ' + str(int(rest)) + ' kcal 👍' if rest > 0 else '⚠️ Meta ultrapassada'}"
         )
 
-async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = str(update.effective_user.id)
-    photo = update.message.photo[-1]
-    file = await photo.get_file()
-    path = f"tmp_{user}.jpg"
-    await file.download_to_drive(path)
-
-    pending[user] = {"image": path}
-    await update.message.reply_text("📸 Foto recebida! Agora descreva.")
-
-async def description_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = str(update.effective_user.id)
-    if user not in pending or "image" not in pending[user]:
-        return
-
-    info = identify_food(update.message.text, pending[user]["image"])
-    base = fetch_usda(info["food"])
-
-    pending[user] = {
-        "grams": info["grams"],
-        "base": base
-    }
-
-    await update.message.reply_text(
-        f"🍽️ {info['food']}\n"
-        f"📏 Estimado: {info['grams']}g\n"
-        "Digite a quantidade real ou 'ok'"
-    )
-
 # =====================
-# 🚀 Main
+# MAIN
 # =====================
-def main():
-    print("🤖 Bot rodando... CTRL+C para parar")
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("resumo", resumo))
-    app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, description_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    app.run_polling()
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("resumo", resumo))
+app.add_handler(MessageHandler(filters.ALL, handle_message))
 
-if __name__ == "__main__":
-    main()
+print("🤖 Bot rodando...")
+app.run_polling()
