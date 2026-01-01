@@ -1,23 +1,27 @@
 import json
 import os
-import requests
 from datetime import date
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from groq import Groq
+import google.generativeai as genai
 
 # 1. Configurações
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GROQ_KEY = os.getenv("GROQ_API_KEY")
-HF_TOKEN = os.getenv("HF_API_TOKEN") # Token da Hugging Face
+GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+
+# Configura o Gemini pela biblioteca oficial
+genai.configure(api_key=GEMINI_KEY)
+model_gemini = genai.GenerativeModel('gemini-1.5-flash')
 
 client_groq = Groq(api_key=GROQ_KEY)
 DATA_FILE = "data.json"
 META_CALORIAS = 3300
 
-# 2. Funções de Dados
+# 2. Banco de Dados
 def load_data():
     if not os.path.exists(DATA_FILE): return {}
     with open(DATA_FILE, "r", encoding="utf-8") as f:
@@ -42,44 +46,48 @@ def ask_groq_text(text):
         return json.loads(res.choices[0].message.content)
     except: return None
 
-# 4. IA Visão (Hugging Face - Llava Model)
-def ask_hf_vision(image_path):
-    # Usando o modelo Llava 1.5 (Gratuito e excelente para fotos)
-    API_URL = "https://api-inference.huggingface.co/models/llava-hf/llava-1.5-7b-hf"
-    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-
-    with open(image_path, "rb") as f:
-        img_data = f.read()
-
+# 4. IA Visão (Biblioteca Oficial Gemini)
+def ask_gemini_vision(image_path):
     try:
-        # Primeiro, pedimos para a IA descrever a foto
-        response = requests.post(API_URL, headers=headers, data=img_data, timeout=30)
-        description = response.json()[0]['generated_text'].split("ASSISTANT:")[-1]
+        # Carrega a imagem
+        with open(image_path, "rb") as f:
+            img_data = f.read()
         
-        # Agora usamos a Groq para transformar essa descrição em calorias (JSON)
-        return ask_groq_text(f"Com base nesta descrição: {description}, calcule as calorias.")
+        prompt = "Você é um nutricionista. Olhe esta imagem e retorne APENAS um JSON: {\"food\": \"nome do prato\", \"calories\": 0}"
+        
+        # Faz a requisição usando a SDK oficial (mais estável)
+        response = model_gemini.generate_content([
+            prompt,
+            {"mime_type": "image/jpeg", "data": img_data}
+        ])
+        
+        # Limpa e converte para JSON
+        text_res = response.text.replace("```json", "").replace("```", "").strip()
+        return json.loads(text_res)
     except Exception as e:
-        print(f"Erro HuggingFace: {e}")
+        print(f"❌ Erro na Visão Gemini: {e}")
         return None
 
-# 5. Handlers
+# 5. Lógica do Bot
 async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.message.from_user.id)
     today = str(date.today())
-    status_msg = await update.message.reply_text("⏳ Processando...")
+    status_msg = await update.message.reply_text("⏳ Analisando...")
 
     if update.message.photo:
         file = await update.message.photo[-1].get_file()
         path = f"img_{user_id}.jpg"
         await file.download_to_drive(path)
-        result = ask_hf_vision(path)
+        result = ask_gemini_vision(path)
         if os.path.exists(path): os.remove(path)
     else:
         result = ask_groq_text(update.message.text)
 
     if result and result.get("food"):
         data = load_data()
-        data.setdefault(user_id, {}).setdefault(today, {"calories": 0})
+        if user_id not in data: data[user_id] = {}
+        if today not in data[user_id]: data[user_id][today] = {"calories": 0}
+        
         data[user_id][today]["calories"] += result["calories"]
         save_data(data)
         
@@ -88,10 +96,10 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
     else:
-        await status_msg.edit_text("❌ Erro ao identificar. Tente descrever por texto.")
+        await status_msg.edit_text("❌ Não consegui identificar a comida.")
 
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, handle_input))
-    print("🚀 Bot rodando! Texto: Groq | Fotos: Hugging Face")
+    print("🚀 Bot rodando! Texto: Groq | Fotos: Gemini SDK")
     app.run_polling()
