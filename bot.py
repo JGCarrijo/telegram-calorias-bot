@@ -3,7 +3,13 @@ import json
 import requests
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
 load_dotenv()
 
@@ -32,50 +38,57 @@ def save_data(data):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📸 Envie a foto da refeição\n"
-        "✍️ Depois envie a descrição (ex: 'uma maçã média')\n\n"
+        "✍️ Depois descreva (ex: 'uma maçã média')\n\n"
         "/resumo → média semanal\n"
         "'primeira refeição' → reinicia o dia"
     )
 
 
 async def reset_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
+    uid = str(update.effective_user.id)
     data = load_data()
-    data[user_id] = []
+    data[uid] = []
     save_data(data)
     await update.message.reply_text("🔄 Dia reiniciado!")
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    USER_STATE[user_id] = {"waiting_description": True}
-    await update.message.reply_text("✍️ Agora descreva a refeição (ex: 'uma maçã média')")
+
+    photo = update.message.photo[-1]
+    USER_STATE[user_id] = {
+        "step": "waiting_description",
+        "photo_file_id": photo.file_id,
+    }
+
+    await update.message.reply_text(
+        "✍️ Agora descreva a refeição\n"
+        "Ex: *uma maçã média*", parse_mode="Markdown"
+    )
 
 
 def ask_gemini(description):
     prompt = f"""
-    O usuário comeu: {description}
+O usuário descreveu a refeição como: {description}
 
-    Identifique UM alimento principal e estime as calorias.
-    Se não for comida, responda "NÃO É ALIMENTO".
+Identifique UM alimento principal e estime as calorias.
+Se não for comida, responda apenas: NÃO É ALIMENTO
 
-    Formato obrigatório:
-    Alimento: nome
-    Calorias: número
-    """
+Formato obrigatório:
+Alimento: nome
+Calorias: número
+"""
 
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
         "gemini-pro:generateContent?key=" + GEMINI_API_KEY
     )
 
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}]
-    }
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
 
     try:
-        response = requests.post(url, json=payload, timeout=30)
-        text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
+        r = requests.post(url, json=payload, timeout=40)
+        text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
         return text
     except Exception:
         return None
@@ -89,21 +102,28 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await reset_day(update, context)
         return
 
-    if user_id not in USER_STATE or not USER_STATE[user_id].get("waiting_description"):
+    if user_id not in USER_STATE:
+        return
+
+    state = USER_STATE[user_id]
+
+    if state["step"] != "waiting_description":
         return
 
     result = ask_gemini(text)
 
     if not result or "NÃO É ALIMENTO" in result.upper():
         await update.message.reply_text(
-            "❌ Não consegui reconhecer o alimento.\n"
-            "👉 Tente algo como: *'uma maçã média'* ou *'200g de arroz cozido'*",
-            parse_mode="Markdown"
+            "❌ Não consegui reconhecer.\n"
+            "👉 Tente algo como:\n"
+            "*uma maçã média*\n"
+            "*200g de arroz cozido*",
+            parse_mode="Markdown",
         )
-        return  # 👈 ESTADO PERMANECE ATIVO
+        return  # 👈 NÃO APAGA O ESTADO
 
-    # ✅ Só encerra o estado quando deu certo
-    USER_STATE[user_id]["waiting_description"] = False
+    # ✅ SUCESSO → AGORA SIM ENCERRA
+    del USER_STATE[user_id]
 
     await update.message.reply_text(f"🍽️ Registro:\n{result}")
 
