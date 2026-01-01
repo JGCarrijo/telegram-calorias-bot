@@ -1,27 +1,32 @@
-import os
 import json
+import os
 import requests
+from datetime import date
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+
+# ========================
+# CONFIG
+# ========================
 
 load_dotenv()
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-if not TELEGRAM_TOKEN:
+if not TOKEN:
     raise RuntimeError("❌ TELEGRAM_BOT_TOKEN não definido")
 
 DATA_FILE = "data.json"
-USER_STATE = {}
 
+META = {
+    "calories": 3300
+}
+
+# ========================
+# UTIL
+# ========================
 
 def load_data():
     if not os.path.exists(DATA_FILE):
@@ -29,54 +34,31 @@ def load_data():
     with open(DATA_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
-
 def save_data(data):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📸 Envie a foto da refeição\n"
-        "✍️ Depois descreva (ex: 'uma maçã média')\n\n"
-        "/resumo → média semanal\n"
-        "'primeira refeição' → reinicia o dia"
-    )
-
-
-async def reset_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = str(update.effective_user.id)
-    data = load_data()
-    data[uid] = []
-    save_data(data)
-    await update.message.reply_text("🔄 Dia reiniciado!")
-
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-
-    photo = update.message.photo[-1]
-    USER_STATE[user_id] = {
-        "step": "waiting_description",
-        "photo_file_id": photo.file_id,
-    }
-
-    await update.message.reply_text(
-        "✍️ Agora descreva a refeição\n"
-        "Ex: *uma maçã média*", parse_mode="Markdown"
-    )
-
+# ========================
+# GEMINI
+# ========================
 
 def ask_gemini(description):
     prompt = f"""
-O usuário descreveu a refeição como: {description}
+Você é um assistente de nutrição.
 
-Identifique UM alimento principal e estime as calorias.
-Se não for comida, responda apenas: NÃO É ALIMENTO
+O usuário descreveu a refeição assim:
+"{description}"
+
+Responda APENAS em JSON válido, sem texto extra.
 
 Formato obrigatório:
-Alimento: nome
-Calorias: número
+{{
+  "food": "nome do alimento",
+  "calories": número
+}}
+
+Se não for possível identificar um alimento, retorne:
+{{ "food": null, "calories": null }}
 """
 
     url = (
@@ -84,65 +66,119 @@ Calorias: número
         "gemini-pro:generateContent?key=" + GEMINI_API_KEY
     )
 
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt}
+                ]
+            }
+        ]
+    }
 
     try:
         r = requests.post(url, json=payload, timeout=40)
-        text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-        return text
-    except Exception:
+        r.raise_for_status()
+        data = r.json()
+
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        parsed = json.loads(text)
+
+        if not parsed.get("food") or not parsed.get("calories"):
+            return None
+
+        return parsed
+
+    except Exception as e:
+        print("Erro Gemini:", e)
         return None
 
+# ========================
+# HANDLERS
+# ========================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📸 Envie a descrição da refeição\n"
+        "Exemplos:\n"
+        "• uma maçã\n"
+        "• prato de arroz e feijão\n\n"
+        "/resumo → resumo do dia\n"
+        "primeira refeição → reinicia o dia"
+    )
+
+async def reset_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = str(update.message.from_user.id)
+    today = str(date.today())
+
+    data = load_data()
+    data.setdefault(user, {})
+    data[user][today] = {"calories": 0}
+
+    save_data(data)
+
+    await update.message.reply_text("🔄 Dia reiniciado!")
+
+async def resumo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = str(update.message.from_user.id)
+    today = str(date.today())
+
+    data = load_data()
+    calories = data.get(user, {}).get(today, {}).get("calories", 0)
+
+    await update.message.reply_text(
+        f"🔥 Hoje: {int(calories)} / {META['calories']} kcal"
+    )
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    text = update.message.text.strip().lower()
+    text = update.message.text.lower().strip()
 
     if text == "primeira refeição":
         await reset_day(update, context)
         return
 
-    if user_id not in USER_STATE:
-        return
-
-    state = USER_STATE[user_id]
-
-    if state["step"] != "waiting_description":
-        return
-
     result = ask_gemini(text)
 
-    if not result or "NÃO É ALIMENTO" in result.upper():
+    if not result:
         await update.message.reply_text(
-            "❌ Não consegui reconhecer.\n"
+            "❌ Não consegui reconhecer o alimento.\n"
             "👉 Tente algo como:\n"
-            "*uma maçã média*\n"
-            "*200g de arroz cozido*",
-            parse_mode="Markdown",
+            "• uma maçã média\n"
+            "• 2 fatias de pão\n"
+            "• prato de arroz e feijão"
         )
-        return  # 👈 NÃO APAGA O ESTADO
+        return
 
-    # ✅ SUCESSO → AGORA SIM ENCERRA
-    del USER_STATE[user_id]
-
-    await update.message.reply_text(f"🍽️ Registro:\n{result}")
+    user = str(update.message.from_user.id)
+    today = str(date.today())
 
     data = load_data()
-    uid = str(user_id)
-    data.setdefault(uid, []).append(result)
+    data.setdefault(user, {})
+    data[user].setdefault(today, {"calories": 0})
+
+    data[user][today]["calories"] += result["calories"]
     save_data(data)
 
+    await update.message.reply_text(
+        f"🍽️ {result['food']}\n"
+        f"🔥 {int(result['calories'])} kcal adicionadas\n\n"
+        f"Total hoje: {int(data[user][today]['calories'])} kcal"
+    )
+
+# ========================
+# MAIN
+# ========================
 
 def main():
-    print("🤖 Bot rodando...")
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    print("🤖 Bot rodando... pressione CTRL+C para parar")
+
+    app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(CommandHandler("resumo", resumo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
