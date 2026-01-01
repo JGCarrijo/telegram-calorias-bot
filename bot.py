@@ -1,98 +1,78 @@
 import json
 import os
 import requests
+import base64
 from datetime import date
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from PIL import Image
-import pytesseract
 
 # ========================
 # CONFIG
 # ========================
-
 load_dotenv()
-
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-if not TOKEN:
-    raise RuntimeError("❌ TELEGRAM_BOT_TOKEN não definido")
+if not TOKEN or not GEMINI_API_KEY:
+    raise RuntimeError("❌ Variáveis de ambiente não configuradas no .env")
 
 DATA_FILE = "data.json"
-
-META = {
-    "calories": 3300
-}
+META = {"calories": 3300}
 
 # ========================
 # UTIL
 # ========================
-
 def load_data():
-    if not os.path.exists(DATA_FILE):
-        return {}
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+    if not os.path.exists(DATA_FILE): return {}
+    with open(DATA_FILE, "r", encoding="utf-8") as f: return json.load(f)
 
 def save_data(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    with open(DATA_FILE, "w", encoding="utf-8") as f: json.dump(data, f, indent=2, ensure_ascii=False)
+
+def encode_image(image_path):
+    with open(image_path, "rb") as image_file:
+        return base64.b64encode(image_file.read()).decode('utf-8')
 
 # ========================
-# GEMINI
+# GEMINI VISION (A MÁGICA ACONTECE AQUI)
 # ========================
+def ask_gemini(description=None, image_path=None):
+    # Usando o modelo flash que é mais rápido e suporta imagem
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    
+    prompt = """Você é um nutricionista digital. Analise o que o usuário enviou (texto ou imagem).
+    Retorne APENAS um JSON no formato: {"food": "nome do item", "calories": 000}.
+    Se for uma imagem, identifique o alimento e estime as calorias.
+    Se não for comida, retorne {"food": null, "calories": null}."""
 
-def ask_gemini(description):
-    prompt = f"""
-Você é um assistente de nutrição.
-
-O usuário descreveu a refeição assim:
-"{description}"
-
-Responda APENAS em JSON válido, sem texto extra.
-
-Formato obrigatório:
-{{
-  "food": "nome do alimento",
-  "calories": número
-}}
-
-Se não for possível identificar um alimento, retorne:
-{{ "food": null, "calories": null }}
-"""
-
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        "gemini-pro:generateContent?key=" + GEMINI_API_KEY
-    )
-
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": prompt}
-                ]
+    parts = [{"text": prompt}]
+    
+    if description:
+        parts.append({"text": f"O usuário enviou este texto: {description}"})
+    
+    if image_path:
+        parts.append({
+            "inline_data": {
+                "mime_type": "image/jpeg",
+                "data": encode_image(image_path)
             }
-        ]
-    }
+        })
+
+    payload = {"contents": [{"parts": parts}]}
 
     try:
-        r = requests.post(url, json=payload, timeout=40)
+        r = requests.post(url, json=payload, timeout=30)
         r.raise_for_status()
-        data = r.json()
-
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
-        parsed = json.loads(text)
-
-        if not parsed.get("food") or not parsed.get("calories"):
-            return None
-
-        return parsed
-
+        res_data = r.json()
+        
+        # Limpeza simples para garantir que pegamos apenas o JSON
+        text_response = res_data["candidates"][0]["content"]["parts"][0]["text"]
+        clean_json = text_response.replace("```json", "").replace("```", "").strip()
+        return json.loads(clean_json)
     except Exception as e:
-        print("Erro Gemini:", e)
+        print(f"Erro na API Gemini: {e}")
         return None
 
 # ========================
@@ -100,135 +80,56 @@ Se não for possível identificar um alimento, retorne:
 # ========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📸 Envie a descrição da refeição ou uma foto com o alimento\n"
-        "Exemplos:\n"
-        "• uma maçã\n"
-        "• prato de arroz e feijão\n\n"
-        "/resumo → resumo do dia\n"
-        "primeira refeição → reinicia o dia"
-    )
+    await update.message.reply_text("🍎 Mande uma foto do seu prato ou descreva o que comeu!")
 
-async def reset_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = str(update.message.from_user.id)
-    today = str(date.today())
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Detecta se é foto ou texto
+    is_photo = bool(update.message.photo)
+    image_path = None
 
-    data = load_data()
-    data.setdefault(user, {})
-    data[user][today] = {"calories": 0}
+    msg = await update.message.reply_text("⏳ Analisando sua refeição...")
 
-    save_data(data)
+    if is_photo:
+        photo_file = await update.message.photo[-1].get_file()
+        image_path = f"temp_{update.message.from_user.id}.jpg"
+        await photo_file.download_to_drive(image_path)
+        result = ask_gemini(image_path=image_path)
+    else:
+        text = update.message.text
+        if text.lower() == "resumo":
+            # Chamar função de resumo aqui (opcional)
+            return
+        result = ask_gemini(description=text)
 
-    await update.message.reply_text("🔄 Dia reiniciado!")
+    if result and result.get("food"):
+        user_id = str(update.message.from_user.id)
+        today = str(date.today())
+        
+        data = load_data()
+        data.setdefault(user_id, {}).setdefault(today, {"calories": 0})
+        data[user_id][today]["calories"] += result["calories"]
+        save_data(data)
 
-async def resumo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = str(update.message.from_user.id)
-    today = str(date.today())
-
-    data = load_data()
-    calories = data.get(user, {}).get(today, {}).get("calories", 0)
-
-    await update.message.reply_text(
-        f"🔥 Hoje: {int(calories)} / {META['calories']} kcal"
-    )
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.lower().strip()
-
-    if text == "primeira refeição":
-        await reset_day(update, context)
-        return
-
-    result = ask_gemini(text)
-
-    if not result:
-        await update.message.reply_text(
-            "❌ Não consegui reconhecer o alimento.\n"
-            "👉 Tente algo como:\n"
-            "• uma maçã média\n"
-            "• 2 fatias de pão\n"
-            "• prato de arroz e feijão"
+        await msg.edit_text(
+            f"✅ Identificado: {result['food']}\n"
+            f"🔥 +{result['calories']} kcal\n"
+            f"📊 Total hoje: {data[user_id][today]['calories']} / {META['calories']} kcal"
         )
-        return
-
-    user = str(update.message.from_user.id)
-    today = str(date.today())
-
-    data = load_data()
-    data.setdefault(user, {})
-    data[user].setdefault(today, {"calories": 0})
-
-    data[user][today]["calories"] += result["calories"]
-    save_data(data)
-
-    await update.message.reply_text(
-        f"🍽️ {result['food']}\n"
-        f"🔥 {int(result['calories'])} kcal adicionadas\n\n"
-        f"Total hoje: {int(data[user][today]['calories'])} kcal"
-    )
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Pega a foto de maior resolução
-    photo_file = await update.message.photo[-1].get_file()
-    file_path = f"temp_{update.message.from_user.id}.jpg"
-    await photo_file.download_to_drive(file_path)
-
-    # Extrai texto da imagem usando OCR
-    try:
-        image = Image.open(file_path)
-        description = pytesseract.image_to_string(image, lang='por')  # usa português
-        description = description.strip()
-    except Exception as e:
-        print("Erro OCR:", e)
-        description = ""
-
-    if not description:
-        await update.message.reply_text(
-            "❌ Não consegui extrair texto da imagem.\n"
-            "👉 Tente descrever o alimento manualmente."
-        )
-        return
-
-    result = ask_gemini(description)
-
-    if not result:
-        await update.message.reply_text(
-            "❌ Não consegui reconhecer o alimento na imagem.\n"
-            "👉 Tente enviar uma descrição por texto."
-        )
-        return
-
-    user = str(update.message.from_user.id)
-    today = str(date.today())
-
-    data = load_data()
-    data.setdefault(user, {})
-    data[user].setdefault(today, {"calories": 0})
-
-    data[user][today]["calories"] += result["calories"]
-    save_data(data)
-
-    await update.message.reply_text(
-        f"🍽️ {result['food']}\n"
-        f"🔥 {int(result['calories'])} kcal adicionadas\n\n"
-        f"Total hoje: {int(data[user][today]['calories'])} kcal"
-    )
+    else:
+        await msg.edit_text("❌ Não consegui identificar o alimento. Tente tirar uma foto mais clara ou descrever em texto.")
+    
+    # Limpa arquivo temporário se existir
+    if image_path and os.path.exists(image_path):
+        os.remove(image_path)
 
 # ========================
 # MAIN
 # ========================
-
-def main():
-    print("🤖 Bot rodando... pressione CTRL+C para parar")
-
-    app = ApplicationBuilder().token(TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("resumo", resumo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-
-    app.run_polling()
-
 if __name__ == "__main__":
-    main()
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    # Um único handler para tratar ambos
+    app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, handle_message))
+    
+    print("🚀 Bot rodando com Gemini Vision!")
+    app.run_polling()
