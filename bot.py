@@ -14,7 +14,7 @@ if not TELEGRAM_TOKEN:
     raise RuntimeError("❌ TELEGRAM_BOT_TOKEN não definido")
 
 DATA_FILE = "data.json"
-USER_STATE = {}  # estado por usuário
+USER_STATE = {}
 
 
 def load_data():
@@ -32,7 +32,7 @@ def save_data(data):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📸 Envie a foto da refeição\n"
-        "Depois envie a descrição (ex: 'uma maçã')\n\n"
+        "✍️ Depois envie a descrição (ex: 'uma maçã média')\n\n"
         "/resumo → média semanal\n"
         "'primeira refeição' → reinicia o dia"
     )
@@ -49,15 +49,17 @@ async def reset_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     USER_STATE[user_id] = {"waiting_description": True}
-    await update.message.reply_text("✍️ Agora envie a descrição da refeição")
+    await update.message.reply_text("✍️ Agora descreva a refeição (ex: 'uma maçã média')")
 
 
 def ask_gemini(description):
     prompt = f"""
     O usuário comeu: {description}
 
-    Identifique o alimento e estime as calorias.
-    Responda no formato:
+    Identifique UM alimento principal e estime as calorias.
+    Se não for comida, responda "NÃO É ALIMENTO".
+
+    Formato obrigatório:
     Alimento: nome
     Calorias: número
     """
@@ -71,12 +73,8 @@ def ask_gemini(description):
         "contents": [{"parts": [{"text": prompt}]}]
     }
 
-    response = requests.post(url, json=payload, timeout=30)
-
-    if response.status_code != 200:
-        return None
-
     try:
+        response = requests.post(url, json=payload, timeout=30)
         text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
         return text
     except Exception:
@@ -85,7 +83,7 @@ def ask_gemini(description):
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    text = update.message.text.lower()
+    text = update.message.text.strip().lower()
 
     if text == "primeira refeição":
         await reset_day(update, context)
@@ -94,13 +92,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in USER_STATE or not USER_STATE[user_id].get("waiting_description"):
         return
 
-    USER_STATE[user_id]["waiting_description"] = False
-
     result = ask_gemini(text)
 
-    if not result:
-        await update.message.reply_text("❌ Não consegui reconhecer o alimento. Tente descrever melhor.")
-        return
+    if not result or "NÃO É ALIMENTO" in result.upper():
+        await update.message.reply_text(
+            "❌ Não consegui reconhecer o alimento.\n"
+            "👉 Tente algo como: *'uma maçã média'* ou *'200g de arroz cozido'*",
+            parse_mode="Markdown"
+        )
+        return  # 👈 ESTADO PERMANECE ATIVO
+
+    # ✅ Só encerra o estado quando deu certo
+    USER_STATE[user_id]["waiting_description"] = False
 
     await update.message.reply_text(f"🍽️ Registro:\n{result}")
 
