@@ -1,166 +1,205 @@
-require "telegram/bot"
-require "net/http"
-require "json"
-require "bigdecimal"
-require "bigdecimal/util"
-require "date"
-require "base64"
-require "logger"
-require "openssl"
+import json
+import base64
+import requests
+from datetime import date, timedelta
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters
+)
 
-# =========================
-# 🔑 TOKENS (JÁ DEFINIDOS)
-# =========================
-TOKEN = "8460032402:AAH1-9x5GpyD30I_bBx6IjDAqFIp_2FV5Zo"
-GEMINI_KEY = "AIzaSyBQbjjMx_5sQ4bNlfkJ5NFTpAmKVYvCOYc"
-USDA_KEY = "WjwD1SJlqgaJfVWee01JeTkTZF8Cx3e9ShnTIhhH"
-
-# =========================
-# ⚙️ NETWORK FIX (WINDOWS)
-# =========================
-Net::HTTP.const_set(:DEFAULT_OPEN_TIMEOUT, 30)
-Net::HTTP.const_set(:DEFAULT_READ_TIMEOUT, 30)
-OpenSSL::SSL::VERIFY_PEER = OpenSSL::SSL::VERIFY_NONE
-
-# =========================
-# 🎯 METAS
-# =========================
-META = {
-  calories: 3300.to_d,
-  protein: 175.to_d,
-  fat: 95.to_d,
-  carbs: 435.to_d
-}
+# =====================
+# 🔑 TOKENS (fixos)
+# =====================
+TELEGRAM_TOKEN = "8460032402:AAH1-9x5GpyD30I_bBx6IjDAqFIp_2FV5Zo"
+GEMINI_API_KEY = "AIzaSyBQbjjMx_5sQ4bNlfkJ5NFTpAmKVYvCOYc"
+USDA_API_KEY = "WjwD1SJlqgaJfVWee01JeTkTZF8Cx3e9ShnTIhhH"
 
 DATA_FILE = "data.json"
 
-def load_data
-  File.exist?(DATA_FILE) ? JSON.parse(File.read(DATA_FILE)) : {}
-end
+META = {
+    "calories": 3300,
+    "protein": 175,
+    "fat": 95,
+    "carbs": 435
+}
 
-def save_data(data)
-  File.write(DATA_FILE, JSON.pretty_generate(data))
-end
+pending = {}
 
-# =========================
+# =====================
+# 📦 Persistência
+# =====================
+def load_data():
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_data(data):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+# =====================
 # 🥗 USDA
-# =========================
-def fetch_usda(food)
-  uri = URI("https://api.nal.usda.gov/fdc/v1/foods/search")
-  uri.query = URI.encode_www_form(
-    api_key: USDA_KEY,
-    query: food,
-    pageSize: 1
-  )
+# =====================
+def fetch_usda(food):
+    url = "https://api.nal.usda.gov/fdc/v1/foods/search"
+    params = {
+        "api_key": USDA_API_KEY,
+        "query": food,
+        "pageSize": 1
+    }
+    r = requests.get(url, params=params).json()
+    nutrients = r["foods"][0]["foodNutrients"]
 
-  res = Net::HTTP.get_response(uri)
-  return { calories: 0, protein: 0, fat: 0, carbs: 0 } unless res.is_a?(Net::HTTPSuccess)
+    def get(name):
+        for n in nutrients:
+            if name in n["nutrientName"].lower():
+                return n.get("value", 0)
+        return 0
 
-  json = JSON.parse(res.body)
-  nutrients = json.dig("foods", 0, "foodNutrients") || []
+    return {
+        "calories": get("energy"),
+        "protein": get("protein"),
+        "fat": get("fat"),
+        "carbs": get("carbohydrate")
+    }
 
-  get = ->(name) {
-    n = nutrients.find { |x| x["nutrientName"].to_s.downcase.include?(name) }
-    n ? n["value"].to_d : 0.to_d
-  }
+# =====================
+# 🧠 Gemini Vision
+# =====================
+def identify_food(text, image_path):
+    with open(image_path, "rb") as f:
+        img_b64 = base64.b64encode(f.read()).decode()
 
-  {
-    calories: get.call("energy"),
-    protein: get.call("protein"),
-    fat: get.call("fat"),
-    carbs: get.call("carbohydrate")
-  }
-end
+    body = {
+        "contents": [{
+            "parts": [
+                {"text": f'Analise a imagem e o texto "{text}". Retorne APENAS JSON no formato {{ "food": "nome", "grams": numero }}'},
+                {
+                    "inline_data": {
+                        "mime_type": "image/jpeg",
+                        "data": img_b64
+                    }
+                }
+            ]
+        }]
+    }
 
-# =========================
-# 🤖 GEMINI
-# =========================
-def identify_food(text, image_path)
-  image_base64 = Base64.strict_encode64(File.binread(image_path))
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro-vision:generateContent?key={GEMINI_API_KEY}"
+    r = requests.post(url, json=body).json()
+    return json.loads(r["candidates"][0]["content"]["parts"][0]["text"])
 
-  body = {
-    contents: [{
-      parts: [
-        { text: "Identifique o alimento e o peso aproximado. Retorne apenas JSON {food, grams}" },
-        { inline_data: { mime_type: "image/jpeg", data: image_base64 } }
-      ]
-    }]
-  }
+# =====================
+# 🤖 Handlers
+# =====================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📸 Envie a foto da refeição + descrição\n"
+        "/resumo → média semanal\n"
+        "'primeira refeição' → reinicia o dia"
+    )
 
-  uri = URI("https://generativelanguage.googleapis.com/v1beta/models/gemini-pro-vision:generateContent?key=#{GEMINI_KEY}")
-  res = Net::HTTP.post(uri, body.to_json, "Content-Type" => "application/json")
+async def resumo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = load_data()
+    user = str(update.effective_user.id)
 
-  json = JSON.parse(res.body)
-  JSON.parse(json["candidates"][0]["content"]["parts"][0]["text"])
-rescue
-  { "food" => "alimento desconhecido", "grams" => 100 }
-end
+    days = [(date.today() - timedelta(days=i)).isoformat() for i in range(7)]
+    week = [data.get(user, {}).get(d) for d in days if d in data.get(user, {})]
 
-# =========================
-# 🚀 BOT
-# =========================
-puts "🤖 Bot rodando (polling puro)... CTRL+C para parar"
+    if not week:
+        await update.message.reply_text("Sem dados ainda 🙂")
+        return
 
-Telegram::Bot::Client.run(TOKEN, logger: Logger.new($stdout)) do |bot|
-  data = load_data
-  pending = {}
+    avg = {k: sum(d[k] for d in week) / len(week) for k in META}
+    await update.message.reply_text(
+        f"📊 Últimos 7 dias\n"
+        f"🔥 {int(avg['calories'])} kcal\n"
+        f"🥩 {int(avg['protein'])} g\n"
+        f"🥑 {int(avg['fat'])} g\n"
+        f"🍞 {int(avg['carbs'])} g"
+    )
 
-  bot.listen do |msg|
-    next unless msg.from
-    user = msg.from.id.to_s
-    today = Date.today.to_s
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message.text.lower()
+    user = str(update.effective_user.id)
+    today = date.today().isoformat()
 
-    data[user] ||= {}
-    data[user][today] ||= META.transform_values { 0.to_d }
+    data = load_data()
+    data.setdefault(user, {})
+    data[user].setdefault(today, {k: 0 for k in META})
 
-    if msg.text == "/start"
-      bot.api.send_message(
-        chat_id: msg.chat.id,
-        text: "📸 Envie a foto da refeição + descrição\nDigite 'primeira refeição' para zerar o dia"
-      )
-    end
+    if msg == "primeira refeição":
+        data[user][today] = {k: 0 for k in META}
+        save_data(data)
+        await update.message.reply_text("🔄 Novo dia iniciado")
+        return
 
-    if msg.text == "primeira refeição"
-      data[user][today] = META.transform_values { 0.to_d }
-      save_data(data)
-      bot.api.send_message(chat_id: msg.chat.id, text: "🔄 Dia reiniciado")
-    end
+    if user in pending and "base" in pending[user]:
+        grams = pending[user]["grams"] if msg == "ok" else float(msg)
+        factor = grams / 100
 
-    if msg.photo
-      file = bot.api.get_file(file_id: msg.photo.last.file_id)
-      path = "img_#{user}.jpg"
-      File.write(path, Net::HTTP.get(URI("https://api.telegram.org/file/bot#{TOKEN}/#{file["result"]["file_path"]}")))
-      pending[user] = { image: path }
-      bot.api.send_message(chat_id: msg.chat.id, text: "📸 Foto recebida! Agora descreva.")
-    end
+        for k in META:
+            data[user][today][k] += pending[user]["base"][k] * factor
 
-    if pending[user]&.dig(:image) && msg.text && !msg.text.start_with?("/")
-      info = identify_food(msg.text, pending[user][:image])
-      base = fetch_usda(info["food"])
-      pending[user] = { grams: info["grams"].to_d, base: base }
+        save_data(data)
+        pending.pop(user)
 
-      bot.api.send_message(
-        chat_id: msg.chat.id,
-        text: "🍽️ #{info["food"]}\nEstimado: #{info["grams"]}g\nDigite a quantidade real ou 'ok'"
-      )
-    end
+        c = data[user][today]
+        await update.message.reply_text(
+            f"🔥 {int(c['calories'])}/{META['calories']} kcal\n"
+            f"🥩 {int(c['protein'])}/{META['protein']} g\n"
+            f"🥑 {int(c['fat'])}/{META['fat']} g\n"
+            f"🍞 {int(c['carbs'])}/{META['carbs']} g"
+        )
 
-    if pending[user]&.dig(:base) && msg.text
-      grams = msg.text == "ok" ? pending[user][:grams] : msg.text.to_d
-      factor = grams / 100
+async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = str(update.effective_user.id)
+    photo = update.message.photo[-1]
+    file = await photo.get_file()
+    path = f"tmp_{user}.jpg"
+    await file.download_to_drive(path)
 
-      META.each_key do |k|
-        data[user][today][k] += pending[user][:base][k] * factor
-      end
+    pending[user] = {"image": path}
+    await update.message.reply_text("📸 Foto recebida! Agora descreva.")
 
-      pending.delete(user)
-      save_data(data)
+async def description_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = str(update.effective_user.id)
+    if user not in pending or "image" not in pending[user]:
+        return
 
-      c = data[user][today]
-      bot.api.send_message(
-        chat_id: msg.chat.id,
-        text: "🔥 #{c["calories"].to_i}/3300 kcal\n🥩 #{c["protein"].to_i}g"
-      )
-    end
-  end
-end
+    info = identify_food(update.message.text, pending[user]["image"])
+    base = fetch_usda(info["food"])
+
+    pending[user] = {
+        "grams": info["grams"],
+        "base": base
+    }
+
+    await update.message.reply_text(
+        f"🍽️ {info['food']}\n"
+        f"📏 Estimado: {info['grams']}g\n"
+        "Digite a quantidade real ou 'ok'"
+    )
+
+# =====================
+# 🚀 Main
+# =====================
+def main():
+    print("🤖 Bot rodando... CTRL+C para parar")
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("resumo", resumo))
+    app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, description_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
