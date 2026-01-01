@@ -7,19 +7,19 @@ from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
-# 1. Carregar configurações do arquivo .env secreto
+# 1. Configurações Iniciais
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 if not TOKEN or not GEMINI_API_KEY:
-    print("❌ Erro: Chaves não detectadas. Verifique seu arquivo .env")
+    print("❌ Erro: Chaves não configuradas no .env")
     exit()
 
 DATA_FILE = "data.json"
 META_CALORIAS = 3300
 
-# 2. Funções de Suporte
+# 2. Funções de Sistema
 def load_data():
     if not os.path.exists(DATA_FILE): return {}
     with open(DATA_FILE, "r", encoding="utf-8") as f:
@@ -34,19 +34,18 @@ def encode_image(image_path):
     with open(image_path, "rb") as image_file:
         return base64.b64encode(image_file.read()).decode('utf-8')
 
-# 3. Inteligência Artificial (Gemini 1.5 Flash)
+# 3. Função de Inteligência Artificial (Corrigida)
 def ask_gemini(description=None, image_path=None):
-    # Usando v1beta e o modelo Flash (Multimodal)
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    # URL com sufixo -latest para evitar erro 404
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={GEMINI_API_KEY}"
     
-    prompt = """Você é um nutricionista digital. 
-    Analise o que foi enviado (texto ou imagem) e retorne APENAS um JSON puro.
-    Formato: {"food": "nome do item", "calories": 500}
-    Se não for comida, use null nos campos."""
+    prompt = """Você é um nutricionista. Analise o que foi enviado e responda APENAS um JSON.
+    Exemplo: {"food": "Frango com arroz", "calories": 450}
+    Se não for comida, responda: {"food": null, "calories": null}"""
 
     parts = [{"text": prompt}]
     if description:
-        parts.append({"text": f"O usuário enviou este texto: {description}"})
+        parts.append({"text": f"O usuário diz: {description}"})
     if image_path:
         parts.append({
             "inline_data": {
@@ -58,47 +57,43 @@ def ask_gemini(description=None, image_path=None):
     payload = {"contents": [{"parts": parts}]}
 
     try:
-        # Enviamos a requisição
         r = requests.post(url, json=payload, timeout=30)
         
-        # Se o status não for 200 (sucesso), avisamos sem mostrar a chave
         if r.status_code != 200:
-            print(f"❌ Erro na API Gemini. Status: {r.status_code}")
-            # Se for 400 ou 403, sua chave provavelmente foi desativada pelo Google
+            print(f"❌ Erro na API. Status: {r.status_code}")
+            # Se der 400 aqui, verifique se sua chave tem espaços extras no .env
             return None
             
         res_data = r.json()
         raw_text = res_data["candidates"][0]["content"]["parts"][0]["text"].strip()
         
-        # Limpando possíveis formatações de markdown da resposta da IA
+        # Limpa formatações de código (```json) que a IA costuma colocar
         clean_json = raw_text.replace("```json", "").replace("```", "").strip()
         return json.loads(clean_json)
-        
     except Exception as e:
-        print(f"⚠️ Erro de processamento interno: {type(e).__name__}")
+        print(f"⚠️ Erro ao processar IA: {type(e).__name__}")
         return None
 
-# 4. Comandos do Telegram
+# 4. Handlers do Telegram
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🍎 *Bot de Calorias Ativo!*\n\nEnvie uma foto do prato ou descreva sua refeição.", parse_mode="Markdown")
+    await update.message.reply_text("🍎 *NutriBot Online!* \nEnvie uma foto ou descreva o que comeu.")
 
 async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.message.from_user.id)
     today = str(date.today())
     image_path = None
 
-    status_msg = await update.message.reply_text("⏳ Processando...")
+    status = await update.message.reply_text("🧐 Analisando...")
 
-    # Verifica se o usuário mandou foto ou texto
     if update.message.photo:
-        photo_file = await update.message.photo[-1].get_file()
+        # Pega a foto de maior qualidade
+        photo = await update.message.photo[-1].get_file()
         image_path = f"temp_{user_id}.jpg"
-        await photo_file.download_to_drive(image_path)
+        await photo.download_to_drive(image_path)
         result = ask_gemini(image_path=image_path)
     else:
         result = ask_gemini(description=update.message.text)
 
-    # Lógica de salvamento e resposta
     if result and result.get("food"):
         data = load_data()
         data.setdefault(user_id, {}).setdefault(today, {"calories": 0})
@@ -107,23 +102,22 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data[user_id][today]["calories"] += cal
         save_data(data)
 
-        await status_msg.edit_text(
-            f"✅ *{result['food']}*\n🔥 +{cal} kcal\n📊 Total de hoje: {data[user_id][today]['calories']} kcal",
-            parse_mode="Markdown"
+        await status.edit_text(
+            f"✅ *{result['food']}*\n🔥 +{cal} kcal\n📊 Total hoje: {data[user_id][today]['calories']} kcal"
         )
     else:
-        await status_msg.edit_text("❌ Não consegui identificar o alimento. Tente descrever por texto.")
+        await status.edit_text("❌ Não consegui identificar. Tente descrever por texto.")
 
-    # Limpeza de arquivos temporários
+    # Apaga a imagem temporária
     if image_path and os.path.exists(image_path):
         os.remove(image_path)
 
-# 5. Loop Principal
+# 5. Inicialização
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TOKEN).build()
     
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO & ~filters.COMMAND, handle_input))
     
-    print("🚀 Bot iniciado com sucesso!")
+    print("🚀 Bot rodando! Mande um 'Oi' no Telegram para testar.")
     app.run_polling()
