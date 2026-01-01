@@ -1,7 +1,7 @@
 import requests
 
 # COLOQUE SUA CHAVE NOVA ENTRE AS ASPAS ABAIXO
-CHAVE = "AIzaSyBQbjjMx_5sQ4bNlfkJ5NFTpAmKVYvCOYc"
+CHAVE = "AIzaSyD3zrTdsEu83hdt5DCjJ8UQ20X8MafCtdc"
 
 # Testando dois endpoints comuns para ver qual responde
 endpoints = [
