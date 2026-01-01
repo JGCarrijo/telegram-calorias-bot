@@ -5,6 +5,8 @@ from datetime import date
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from PIL import Image
+import pytesseract
 
 # ========================
 # CONFIG
@@ -99,7 +101,7 @@ Se não for possível identificar um alimento, retorne:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📸 Envie a descrição da refeição\n"
+        "📸 Envie a descrição da refeição ou uma foto com o alimento\n"
         "Exemplos:\n"
         "• uma maçã\n"
         "• prato de arroz e feijão\n\n"
@@ -165,6 +167,53 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Total hoje: {int(data[user][today]['calories'])} kcal"
     )
 
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Pega a foto de maior resolução
+    photo_file = await update.message.photo[-1].get_file()
+    file_path = f"temp_{update.message.from_user.id}.jpg"
+    await photo_file.download_to_drive(file_path)
+
+    # Extrai texto da imagem usando OCR
+    try:
+        image = Image.open(file_path)
+        description = pytesseract.image_to_string(image, lang='por')  # usa português
+        description = description.strip()
+    except Exception as e:
+        print("Erro OCR:", e)
+        description = ""
+
+    if not description:
+        await update.message.reply_text(
+            "❌ Não consegui extrair texto da imagem.\n"
+            "👉 Tente descrever o alimento manualmente."
+        )
+        return
+
+    result = ask_gemini(description)
+
+    if not result:
+        await update.message.reply_text(
+            "❌ Não consegui reconhecer o alimento na imagem.\n"
+            "👉 Tente enviar uma descrição por texto."
+        )
+        return
+
+    user = str(update.message.from_user.id)
+    today = str(date.today())
+
+    data = load_data()
+    data.setdefault(user, {})
+    data[user].setdefault(today, {"calories": 0})
+
+    data[user][today]["calories"] += result["calories"]
+    save_data(data)
+
+    await update.message.reply_text(
+        f"🍽️ {result['food']}\n"
+        f"🔥 {int(result['calories'])} kcal adicionadas\n\n"
+        f"Total hoje: {int(data[user][today]['calories'])} kcal"
+    )
+
 # ========================
 # MAIN
 # ========================
@@ -177,6 +226,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("resumo", resumo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
     app.run_polling()
 
