@@ -9,7 +9,6 @@ require "base64"
 TOKEN = ENV["TELEGRAM_BOT_TOKEN"]
 USDA_KEY = ENV["USDA_API_KEY"]
 GEMINI_KEY = ENV["GEMINI_API_KEY"]
-puts "TOKEN: #{TOKEN.inspect}"
 
 META = {
   calories: 3300.to_d,
