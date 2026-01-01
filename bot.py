@@ -14,15 +14,29 @@ GROQ_KEY = os.getenv("GROQ_API_KEY")
 
 client = Groq(api_key=GROQ_KEY)
 DATA_FILE = "data.json"
-# Usando o modelo de visão da Groq (Llama 3.2 11b Vision)
-MODEL_VISION = "llama-3.2-11b-vision-preview"
+
+# MODELOS ATUALIZADOS PARA 2026
+MODEL_VISION = "llama-3.2-11b-vision-instant" 
 MODEL_TEXT = "llama-3.3-70b-versatile"
 
 def encode_image(image_path):
     with open(image_path, "rb") as image_file:
         return base64.b64encode(image_file.read()).decode('utf-8')
 
-# 2. IA Unificada (Groq para tudo!)
+# 2. Funções de Dados
+def load_data():
+    if not os.path.exists(DATA_FILE): return {}
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
+        try:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except: return {}
+
+def save_data(data):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+# 3. Inteligência Artificial (Groq)
 def ask_groq_vision(image_path):
     base64_image = encode_image(image_path)
     try:
@@ -32,7 +46,7 @@ def ask_groq_vision(image_path):
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": "Retorne APENAS um JSON: {\"food\": \"nome\", \"calories\": 0}"},
+                        {"type": "text", "text": "Aja como nutricionista. Identifique o alimento e estime as calorias. Retorne APENAS um JSON: {\"food\": \"nome\", \"calories\": 0}"},
                         {
                             "type": "image_url",
                             "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
@@ -51,13 +65,13 @@ def ask_groq_text(text):
     try:
         response = client.chat.completions.create(
             model=MODEL_TEXT,
-            messages=[{"role": "user", "content": f"Nutricionista. Analise: {text}. JSON: {{\"food\": \"nome\", \"calories\": 0}}"}],
+            messages=[{"role": "user", "content": f"Nutricionista. Analise: {text}. Retorne APENAS JSON: {{\"food\": \"nome\", \"calories\": 0}}"}],
             response_format={"type": "json_object"}
         )
         return json.loads(response.choices[0].message.content)
     except: return None
 
-# 3. Lógica do Telegram
+# 4. Handlers do Telegram
 async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.message.from_user.id)
     today = str(date.today())
@@ -73,16 +87,27 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = ask_groq_text(update.message.text)
 
     if result and "calories" in result:
-        # (Lógica de salvar no JSON igual à anterior)
-        with open(DATA_FILE, "r+") as f: # Simplificado para o exemplo
-            # ... (código de salvamento que já temos)
-            pass
-        await status_msg.edit_text(f"✅ {result['food']} - {result['calories']} kcal")
+        data = load_data()
+        if user_id not in data: data[user_id] = {}
+        if today not in data[user_id]: data[user_id][today] = {"calories": 0}
+        
+        cal = result["calories"]
+        data[user_id][today]["calories"] += cal
+        save_data(data)
+        
+        total = data[user_id][today]["calories"]
+        await status_msg.edit_text(
+            f"✅ *{result['food']}*\n🔥 +{cal} kcal\n📊 Total hoje: {total} kcal",
+            parse_mode="Markdown"
+        )
     else:
-        await status_msg.edit_text("❌ Não consegui identificar.")
+        await status_msg.edit_text("❌ Não consegui identificar a comida. Tente mandar outra foto ou escrever o nome.")
 
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, handle_input))
-    print("🚀 BOT 100% GROQ ATIVO! Sem frescura de Gemini.")
+    print("-" * 30)
+    print("🚀 BOT GROQ VISION ATUALIZADO!")
+    print(f"Modelo: {MODEL_VISION}")
+    print("-" * 30)
     app.run_polling()
