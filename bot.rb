@@ -2,11 +2,13 @@ require "telegram/bot"
 require "net/http"
 require "json"
 require "bigdecimal"
+require "bigdecimal/util"
 require "date"
+require "base64"
 
 TOKEN = ENV["TELEGRAM_BOT_TOKEN"]
-GEMINI = Google::GenerativeAI::Client.new(api_key: ENV["GEMINI_API_KEY"])
 USDA_KEY = ENV["USDA_API_KEY"]
+GEMINI_KEY = ENV["GEMINI_API_KEY"]
 
 META = {
   calories: 3300.to_d,
@@ -44,25 +46,36 @@ def fetch_usda(food)
 end
 
 def identify_food(text, image_path)
-  image = File.binread(image_path)
+  image_base64 = Base64.strict_encode64(File.binread(image_path))
 
   prompt = <<~PROMPT
     Analise a imagem e o texto "#{text}".
-    Retorne APENAS JSON:
+    Retorne APENAS JSON no formato:
     { "food": "nome", "grams": numero }
   PROMPT
 
-  res = GEMINI.models.generate_content(
-    model: "gemini-1.5-pro",
+  body = {
     contents: [
-      { role: "user", parts: [
-        { text: prompt },
-        { inline_data: { mime_type: "image/jpeg", data: image } }
-      ]}
+      {
+        parts: [
+          { text: prompt },
+          {
+            inline_data: {
+              mime_type: "image/jpeg",
+              data: image_base64
+            }
+          }
+        ]
+      }
     ]
-  )
+  }
 
-  JSON.parse(res.text)
+  uri = URI("https://generativelanguage.googleapis.com/v1beta/models/gemini-pro-vision:generateContent?key=#{GEMINI_KEY}")
+
+  res = Net::HTTP.post(uri, body.to_json, "Content-Type" => "application/json")
+  json = JSON.parse(res.body)
+
+  JSON.parse(json["candidates"][0]["content"]["parts"][0]["text"])
 end
 
 Telegram::Bot::Client.run(TOKEN) do |bot|
@@ -73,15 +86,17 @@ Telegram::Bot::Client.run(TOKEN) do |bot|
     user = msg.from.id.to_s
     today = Date.today.to_s
     data[user] ||= {}
-    data[user][today] ||= META.transform_values { 0 }
+    data[user][today] ||= META.transform_values { 0.to_d }
 
     if msg.text == "/start"
-      bot.api.send_message(chat_id: msg.chat.id,
-        text: "📸 Envie a foto da refeição + descrição\n/resumo → resumo semanal\n'primeira refeição' → novo dia")
+      bot.api.send_message(
+        chat_id: msg.chat.id,
+        text: "📸 Envie a foto da refeição + descrição\n/resumo → resumo semanal\n'primeira refeição' → novo dia"
+      )
     end
 
     if msg.text == "primeira refeição"
-      data[user][today] = META.transform_values { 0 }
+      data[user][today] = META.transform_values { 0.to_d }
       save_data(data)
       bot.api.send_message(chat_id: msg.chat.id, text: "🔄 Novo dia iniciado")
     end
@@ -89,7 +104,10 @@ Telegram::Bot::Client.run(TOKEN) do |bot|
     if msg.photo
       file = bot.api.get_file(file_id: msg.photo.last.file_id)
       path = "tmp_#{user}.jpg"
-      File.write(path, Net::HTTP.get(URI("https://api.telegram.org/file/bot#{TOKEN}/#{file["result"]["file_path"]}")))
+      File.write(
+        path,
+        Net::HTTP.get(URI("https://api.telegram.org/file/bot#{TOKEN}/#{file["result"]["file_path"]}"))
+      )
       pending[user] = { image: path }
       bot.api.send_message(chat_id: msg.chat.id, text: "📸 Foto recebida! Agora descreva.")
     end
@@ -103,8 +121,10 @@ Telegram::Bot::Client.run(TOKEN) do |bot|
         base: base
       }
 
-      bot.api.send_message(chat_id: msg.chat.id,
-        text: "🍽️ #{info["food"]}\n📏 Estimado: #{info["grams"]}g\nDigite a quantidade real ou 'ok'")
+      bot.api.send_message(
+        chat_id: msg.chat.id,
+        text: "🍽️ #{info["food"]}\n📏 Estimado: #{info["grams"]}g\nDigite a quantidade real ou 'ok'"
+      )
     end
 
     if pending[user]&.dig(:base) && msg.text
@@ -121,20 +141,24 @@ Telegram::Bot::Client.run(TOKEN) do |bot|
       c = data[user][today]
       rest = META[:calories] - c["calories"].to_d
 
-      bot.api.send_message(chat_id: msg.chat.id,
-        text: "🔥 #{c["calories"].to_i}/3300 kcal\n🥩 #{c["protein"].to_i}/175g\n🥑 #{c["fat"].to_i}/95g\n🍞 #{c["carbs"].to_i}/435g\n\n#{rest > 0 ? "👉 Restam #{rest.to_i} kcal 👍" : "⚠️ Meta ultrapassada"}")
+      bot.api.send_message(
+        chat_id: msg.chat.id,
+        text: "🔥 #{c["calories"].to_i}/3300 kcal\n🥩 #{c["protein"].to_i}/175g\n🥑 #{c["fat"].to_i}/95g\n🍞 #{c["carbs"].to_i}/435g\n\n#{rest > 0 ? "👉 Restam #{rest.to_i} kcal 👍" : "⚠️ Meta ultrapassada"}"
+      )
     end
 
     if msg.text == "/resumo"
       days = (0..6).map { |i| (Date.today - i).to_s }
       week = days.map { |d| data[user][d] }.compact
 
-      avg = META.transform_values { |v| 0.to_d }
+      avg = META.transform_values { 0.to_d }
       week.each { |d| avg.each_key { |k| avg[k] += d[k].to_d } }
       avg.each_key { |k| avg[k] /= week.size if week.any? }
 
-      bot.api.send_message(chat_id: msg.chat.id,
-        text: "📊 Últimos 7 dias\n🔥 Média: #{avg[:calories].to_i} kcal\n🥩 #{avg[:protein].to_i}g\n🥑 #{avg[:fat].to_i}g\n🍞 #{avg[:carbs].to_i}g")
+      bot.api.send_message(
+        chat_id: msg.chat.id,
+        text: "📊 Últimos 7 dias\n🔥 Média: #{avg[:calories].to_i} kcal\n🥩 #{avg[:protein].to_i}g\n🥑 #{avg[:fat].to_i}g\n🍞 #{avg[:carbs].to_i}g"
+      )
     end
   end
 end
